@@ -23,22 +23,6 @@ import io.flutter.view.TextureRegistry;
  * Interaction from SurfaceHolder lifecycle in surfaceCreated, surfaceChanged, and surfaceDestroyed.
  */
 public class SurfaceTextureRenderer extends EglRenderer {
-  /**
-   * Told, on the frame delivery thread, that frames no longer match the size
-   * of the surface they are drawn into. The surface is not swapped in place:
-   * the owner sets the renderer up again (release, init, surfaceCreated) so
-   * the next frame gets a surface of the new size in a fresh EGL context.
-   */
-  public interface SurfaceSizeListener {
-    void onSurfaceSizeChanged(int width, int height);
-  }
-
-  private volatile SurfaceSizeListener surfaceSizeListener;
-
-  public void setSurfaceSizeListener(SurfaceSizeListener listener) {
-    surfaceSizeListener = listener;
-  }
-
   // Callback for reporting renderer events. Read-only after initilization so no lock required.
   private RendererCommon.RendererEvents rendererEvents;
   private final Object layoutLock = new Object();
@@ -114,63 +98,35 @@ public class SurfaceTextureRenderer extends EglRenderer {
   // VideoSink interface.
   @Override
   public void onFrame(VideoFrame frame) {
-    SurfaceSizeListener sizeListener = null;
     synchronized (surfaceLock) {
       if(surface == null) {
-        surfaceWidth = frame.getRotatedWidth();
-        surfaceHeight = frame.getRotatedHeight();
-        sizeChangeReported = false;
-        producer.setSize(surfaceWidth, surfaceHeight);
+        producer.setSize(frame.getRotatedWidth(),frame.getRotatedHeight());
         surface = producer.getSurface();
         createEglSurface(surface);
-      } else if (!sizeChangeReported && frameSizeChanged(frame)) {
+      } else if (frameSizeChanged(frame)) {
         // The producer's backing buffers are fixed-size: setSize() only takes
-        // effect for a Surface obtained afterwards. Swapping the EGL surface of
-        // this renderer onto that new Surface in place left the picture frozen
-        // on some devices (frames kept being rendered, the texture never
-        // updated). Instead the size is set here and the owner sets the whole
-        // renderer up again, the same sequence as binding a track, so the next
-        // frame obtains the new Surface in a fresh EGL context. Until then
-        // frames keep going to the current surface, scaled.
+        // effect for a Surface obtained afterwards. Without recreating the EGL
+        // surface here, a simulcast layer upgrade keeps rendering into the old
+        // low-resolution buffer and the video stays blurry.
+        releaseEglSurface(() -> {});
+        // Clear the field before re-obtaining: if getSurface() throws, the
+        // next frame takes the surface == null path and recreates cleanly
+        // rather than rendering into the already-released surface.
+        surface = null;
         producer.setSize(frame.getRotatedWidth(), frame.getRotatedHeight());
-        sizeChangeReported = true;
-        sizeListener = surfaceSizeListener;
+        surface = producer.getSurface();
+        createEglSurface(surface);
       }
-    }
-    if (sizeListener != null) {
-      sizeListener.onSurfaceSizeChanged(
-          frame.getRotatedWidth(), frame.getRotatedHeight());
     }
     updateFrameDimensionsAndReportEvents(frame);
     super.onFrame(frame);
   }
 
-  // Whether [frame] no longer matches the surface it would be drawn into.
-  // Called with surfaceLock held.
   private boolean frameSizeChanged(VideoFrame frame) {
     synchronized (layoutLock) {
-      if (isRenderingPaused) {
-        return false;
-      }
-    }
-    return surfaceWidth != frame.getRotatedWidth()
-        || surfaceHeight != frame.getRotatedHeight();
-  }
-
-  /**
-   * Also forgets the Surface: after init() the first frame obtains the
-   * producer's current Surface (of the size last set) and creates the EGL
-   * surface on it.
-   */
-  @Override
-  public void release() {
-    super.release();
-    synchronized (surfaceLock) {
-      // init() posts the EGL surface creation again with the last Surface
-      // given to createEglSurface(), which would be the old size's. With the
-      // render thread gone this only clears it, synchronously.
-      releaseEglSurface(() -> {});
-      surface = null;
+      return !isRenderingPaused
+          && (rotatedFrameWidth != frame.getRotatedWidth()
+              || rotatedFrameHeight != frame.getRotatedHeight());
     }
   }
 
@@ -183,13 +139,6 @@ public class SurfaceTextureRenderer extends EglRenderer {
   // thread, which never acquires it, so the wait cannot deadlock.
   private final Object surfaceLock = new Object();
   private Surface surface = null;
-
-  // Rotated size the current Surface was obtained for, and whether a change
-  // from it was already reported to the SurfaceSizeListener. Guarded by
-  // surfaceLock.
-  private int surfaceWidth;
-  private int surfaceHeight;
-  private boolean sizeChangeReported;
 
   private TextureRegistry.SurfaceProducer producer;
 

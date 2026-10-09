@@ -2,9 +2,6 @@ package com.cloudwebrtc.webrtc;
 
 import android.util.Log;
 import android.graphics.SurfaceTexture;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.SystemClock;
 import android.view.Surface;
 
 import com.cloudwebrtc.webrtc.utils.AnyThreadSink;
@@ -31,8 +28,6 @@ public class FlutterRTCVideoRenderer implements EventChannel.StreamHandler {
     private String ownerTag;
 
     public void Dispose() {
-        disposed = true;
-        mainHandler.removeCallbacks(resetForNewSize);
         setVideoTrack(null);
         if (surfaceTextureRenderer != null) {
             surfaceTextureRenderer.release();
@@ -106,58 +101,8 @@ public class FlutterRTCVideoRenderer implements EventChannel.StreamHandler {
     EventChannel eventChannel;
     EventChannel.EventSink eventSink;
 
-    /**
-     * A size change is followed by at most one renderer reset per this
-     * interval, so a sender stepping through several resolutions in a row
-     * does not reset it on every step.
-     */
-    private static final long RESET_MIN_INTERVAL_MS = 500;
-
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private boolean disposed = false;
-    private boolean resetScheduled = false;
-    private long lastResetMs = 0;
-
-    /**
-     * Sets the renderer up again on the track it renders, on the main thread:
-     * the frames changed size and the next one obtains a Surface of that size
-     * in a fresh EGL context (see SurfaceTextureRenderer.onFrame).
-     */
-    private final Runnable resetForNewSize = new Runnable() {
-        @Override
-        public void run() {
-            resetScheduled = false;
-            if (disposed || videoTrack == null
-                    || EglUtils.getRootEglBaseContext() == null) {
-                return;
-            }
-            lastResetMs = SystemClock.elapsedRealtime();
-            removeRendererFromVideoTrack();
-            try {
-                tryAddRendererToVideoTrack();
-            } catch (Exception e) {
-                // The track was disposed meanwhile: the next setVideoTrack
-                // sets the renderer up.
-                Log.w(TAG, "FlutterRTCVideoRenderer: reset for new frame size failed: " + e);
-            }
-        }
-    };
-
-    private void onSurfaceSizeChanged(int width, int height) {
-        // Frame delivery thread.
-        mainHandler.post(() -> {
-            if (disposed || resetScheduled) {
-                return;
-            }
-            resetScheduled = true;
-            long wait = lastResetMs + RESET_MIN_INTERVAL_MS - SystemClock.elapsedRealtime();
-            mainHandler.postDelayed(resetForNewSize, Math.max(0, wait));
-        });
-    }
-
     public FlutterRTCVideoRenderer(TextureRegistry.SurfaceProducer producer) {
         this.surfaceTextureRenderer = new SurfaceTextureRenderer("");
-        surfaceTextureRenderer.setSurfaceSizeListener(this::onSurfaceSizeChanged);
         listenRendererEvents();
         surfaceTextureRenderer.init(EglUtils.getRootEglBaseContext(), rendererEvents);
         surfaceTextureRenderer.surfaceCreated(producer);
