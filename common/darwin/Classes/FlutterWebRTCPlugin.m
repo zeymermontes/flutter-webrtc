@@ -355,17 +355,28 @@ static void FlutterWebRTCApplyFieldTrials(void) {
 }
 
 -(void) initLoggerCallback:(RTCLoggingSeverity)severity {
-  if(loggerCallback == nil) {
-    loggerCallback = [RTC_OBJC_TYPE(RTCCallbackLogger) new];
-    [loggerCallback start:^(NSString *logMessage) {
-      postEvent(self.eventSink, @{
-        @"event" : @"onLogData",
-        @"data" : logMessage
-      });
-    }];
+  // RTCCallbackLogger reads its severity once, in start: (it begins at
+  // info), so a later change needs a new logger. With none there is no
+  // logger at all: nothing native, key material logged by the frame
+  // cryptor included, is forwarded to Dart.
+  if (loggerCallback != nil) {
+    if (loggerCallback.severity == severity) {
+      return;
+    }
+    [loggerCallback stop];
+    loggerCallback = nil;
   }
-
+  if (severity == RTCLoggingSeverityNone) {
+    return;
+  }
+  loggerCallback = [RTC_OBJC_TYPE(RTCCallbackLogger) new];
   loggerCallback.severity = severity;
+  [loggerCallback start:^(NSString *logMessage) {
+    postEvent(self.eventSink, @{
+      @"event" : @"onLogData",
+      @"data" : logMessage
+    });
+  }];
 }
 
 -(RTCLoggingSeverity)str2LogSeverity:(NSString*)str {
