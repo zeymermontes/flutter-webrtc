@@ -9,6 +9,17 @@ import 'package:webrtc_interface/webrtc_interface.dart';
 
 import 'rtc_video_platform_view_controller.dart';
 
+/// Sent up the tree by [RTCVideoPlatFormView] when the size or rotation of
+/// the frames it shows changes (and on the first frame). A texture renderer
+/// exposes this through its value; a platform view created by another widget
+/// has no renderer to read, so its ancestors learn the video's shape from
+/// this notification instead.
+class RTCVideoPlatformViewValueNotification extends Notification {
+  const RTCVideoPlatformViewValueNotification(this.value);
+
+  final RTCVideoValue value;
+}
+
 class RTCVideoPlatFormView extends StatefulWidget {
   const RTCVideoPlatFormView({
     super.key,
@@ -28,9 +39,27 @@ class RTCVideoPlatFormView extends StatefulWidget {
 class NativeVideoPlayerViewState extends State<RTCVideoPlatFormView> {
   RTCVideoPlatformViewController? _controller;
   bool _showVideoView = false;
+  RTCVideoValue? _sentValue;
+
+  void _onValue() {
+    final controller = _controller;
+    if (!mounted || controller == null) return;
+    final value = controller.value;
+    final sent = _sentValue;
+    if (sent != null &&
+        sent.width == value.width &&
+        sent.height == value.height &&
+        sent.rotation == value.rotation) {
+      return;
+    }
+    _sentValue = value;
+    RTCVideoPlatformViewValueNotification(value).dispatch(context);
+  }
+
   @override
   void dispose() {
     final controller = _controller;
+    controller?.removeListener(_onValue);
     controller?.onFirstFrameRendered = null;
     controller?.onSrcObjectChange = null;
     controller?.onResize = null;
@@ -122,6 +151,7 @@ class NativeVideoPlayerViewState extends State<RTCVideoPlatFormView> {
     controller.onFirstFrameRendered = () => showVideoView(true);
     controller.onSrcObjectChange = () => showVideoView(false);
     controller.onResize = () => showVideoView(true);
+    controller.addListener(_onValue);
     await controller.initialize();
     if (!mounted || _controller != controller) return;
     widget.onViewReady?.call(controller);
