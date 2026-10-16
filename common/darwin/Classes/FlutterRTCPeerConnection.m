@@ -6,6 +6,77 @@
 
 #import <WebRTC/WebRTC.h>
 
+// getStats never runs on the main thread: reading the senders, the
+// receivers and their tracks, and asking for the stats, are blocking calls
+// into WebRTC's signaling thread. While that thread is busy (or the
+// device is throttled), the main thread waited with them and the system
+// could kill the app for not answering. The work goes to a serial queue of
+// its own; the reply goes back on the main thread, once.
+
+// Requests still waiting for their stats. Past this, a new request is
+// answered at once with no stats instead of piling up behind a stuck one.
+static const NSInteger kFlutterWebRTCMaxPendingStats = 8;
+// A request whose stats never come is answered with none after this.
+static const int64_t kFlutterWebRTCStatsTimeoutSeconds = 10;
+// Read and written on the main thread only.
+static NSInteger flutterWebRTCPendingStats = 0;
+
+static dispatch_queue_t FlutterWebRTCStatsQueue(void) {
+  static dispatch_queue_t queue;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    queue = dispatch_queue_create(
+        "com.cloudwebrtc.flutterwebrtc.stats",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+  });
+  return queue;
+}
+
+static NSDictionary* FlutterWebRTCStatsMap(RTCStatisticsReport* statsReport) {
+  NSMutableArray* stats = [NSMutableArray array];
+  for (id key in statsReport.statistics) {
+    RTCStatistics* report = [statsReport.statistics objectForKey:key];
+    [stats addObject:@{
+      @"id" : report.id,
+      @"type" : report.type,
+      @"timestamp" : @(report.timestamp_us),
+      @"values" : report.values
+    }];
+  }
+  return @{@"stats" : stats};
+}
+
+// Runs [work] on the stats queue, called on the main thread. [work] gets a
+// reply block that may be called on any thread; [result] is answered on the
+// main thread, exactly once: with the reply, or with no stats when too many
+// requests wait or the reply takes too long.
+static void FlutterWebRTCRunStats(FlutterResult result, void (^work)(void (^reply)(id value))) {
+  if (flutterWebRTCPendingStats >= kFlutterWebRTCMaxPendingStats) {
+    result(@{@"stats" : @[]});
+    return;
+  }
+  flutterWebRTCPendingStats++;
+  __block BOOL answered = NO;
+  void (^answer)(id) = ^(id value) {
+    // Main thread only: [answered] and the counter are never shared.
+    if (answered) return;
+    answered = YES;
+    flutterWebRTCPendingStats--;
+    result(value);
+  };
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kFlutterWebRTCStatsTimeoutSeconds * NSEC_PER_SEC),
+                 dispatch_get_main_queue(), ^{
+                   answer(@{@"stats" : @[]});
+                 });
+  dispatch_async(FlutterWebRTCStatsQueue(), ^{
+    work(^(id value) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        answer(value);
+      });
+    });
+  });
+}
+
 @implementation RTCPeerConnection (Flutter)
 
 @dynamic eventSink;
@@ -202,73 +273,49 @@
 - (void)peerConnectionGetStatsForTrackId:(nonnull NSString*)trackID
                           peerConnection:(nonnull RTCPeerConnection*)peerConnection
                                   result:(nonnull FlutterResult)result {
-  RTCRtpSender* sender = nil;
-  RTCRtpReceiver* receiver = nil;
+  FlutterWebRTCRunStats(result, ^(void (^reply)(id value)) {
+    RTCRtpSender* sender = nil;
+    RTCRtpReceiver* receiver = nil;
 
-  for (RTCRtpSender* s in peerConnection.senders) {
-    if (s.track != nil && [s.track.trackId isEqualToString:trackID]) {
-      sender = s;
+    for (RTCRtpSender* s in peerConnection.senders) {
+      RTCMediaStreamTrack* track = s.track;
+      if (track != nil && [track.trackId isEqualToString:trackID]) {
+        sender = s;
+      }
     }
-  }
 
-  for (RTCRtpReceiver* r in peerConnection.receivers) {
-    if (r.track != nil && [r.track.trackId isEqualToString:trackID]) {
-      receiver = r;
+    for (RTCRtpReceiver* r in peerConnection.receivers) {
+      RTCMediaStreamTrack* track = r.track;
+      if (track != nil && [track.trackId isEqualToString:trackID]) {
+        receiver = r;
+      }
     }
-  }
 
-  if (sender != nil) {
-    [peerConnection statisticsForSender:sender
-                      completionHandler:^(RTCStatisticsReport* statsReport) {
-                        NSMutableArray* stats = [NSMutableArray array];
-                        for (id key in statsReport.statistics) {
-                          RTCStatistics* report = [statsReport.statistics objectForKey:key];
-                          [stats addObject:@{
-                            @"id" : report.id,
-                            @"type" : report.type,
-                            @"timestamp" : @(report.timestamp_us),
-                            @"values" : report.values
-                          }];
-                        }
-                        result(@{@"stats" : stats});
-                      }];
-  } else if (receiver != nil) {
-    [peerConnection statisticsForReceiver:receiver
+    if (sender != nil) {
+      [peerConnection statisticsForSender:sender
                         completionHandler:^(RTCStatisticsReport* statsReport) {
-                          NSMutableArray* stats = [NSMutableArray array];
-                          for (id key in statsReport.statistics) {
-                            RTCStatistics* report = [statsReport.statistics objectForKey:key];
-                            [stats addObject:@{
-                              @"id" : report.id,
-                              @"type" : report.type,
-                              @"timestamp" : @(report.timestamp_us),
-                              @"values" : report.values
-                            }];
-                          }
-                          result(@{@"stats" : stats});
+                          reply(FlutterWebRTCStatsMap(statsReport));
                         }];
-  } else {
-    result([FlutterError errorWithCode:@"GetStatsFailed"
-                               message:[NSString stringWithFormat:@"Error %@", @""]
-                               details:nil]);
-  }
+    } else if (receiver != nil) {
+      [peerConnection statisticsForReceiver:receiver
+                          completionHandler:^(RTCStatisticsReport* statsReport) {
+                            reply(FlutterWebRTCStatsMap(statsReport));
+                          }];
+    } else {
+      reply([FlutterError errorWithCode:@"GetStatsFailed"
+                                message:[NSString stringWithFormat:@"Error %@", @""]
+                                details:nil]);
+    }
+  });
 }
 
 - (void)peerConnectionGetStats:(nonnull RTCPeerConnection*)peerConnection
                         result:(nonnull FlutterResult)result {
-  [peerConnection statisticsWithCompletionHandler:^(RTCStatisticsReport* statsReport) {
-    NSMutableArray* stats = [NSMutableArray array];
-    for (id key in statsReport.statistics) {
-      RTCStatistics* report = [statsReport.statistics objectForKey:key];
-      [stats addObject:@{
-        @"id" : report.id,
-        @"type" : report.type,
-        @"timestamp" : @(report.timestamp_us),
-        @"values" : report.values
-      }];
-    }
-    result(@{@"stats" : stats});
-  }];
+  FlutterWebRTCRunStats(result, ^(void (^reply)(id value)) {
+    [peerConnection statisticsWithCompletionHandler:^(RTCStatisticsReport* statsReport) {
+      reply(FlutterWebRTCStatsMap(statsReport));
+    }];
+  });
 }
 
 - (NSString*)stringForICEConnectionState:(RTCIceConnectionState)state {
