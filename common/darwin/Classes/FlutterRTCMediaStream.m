@@ -322,11 +322,16 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       return possibleValue;
     }
   } else if ([constraint isKindOfClass:[NSDictionary class]]) {
-    id idealConstraint = constraint[@"ideal"];
-    if ([idealConstraint isKindOfClass:[NSString class]]) {
-      int possibleValue = [idealConstraint intValue];
-      if (possibleValue != 0) {
-        return possibleValue;
+    // ConstrainULong / ConstrainDouble: {exact}, {ideal} or {max}, as a
+    // number or a string. A {max: 24} frame rate used to read as 0 and the
+    // camera then ran at the format's top rate (60 fps on recent iPhones).
+    for (NSString* bound in @[ @"exact", @"ideal", @"max" ]) {
+      id value = constraint[bound];
+      if ([value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSString class]]) {
+        int possibleValue = [value intValue];
+        if (possibleValue > 0) {
+          return possibleValue;
+        }
       }
     }
   }
@@ -991,11 +996,21 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 }
 
 - (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {
+  // No frame rate asked for (targetFps 0) means 30, never 0: a frame
+  // duration of 1/0 makes AVFoundation fall back to the format's top rate.
+  NSInteger wanted = targetFps > 0 ? targetFps : 30;
   Float64 maxSupportedFramerate = 0;
+  Float64 minSupportedFramerate = DBL_MAX;
   for (AVFrameRateRange* fpsRange in format.videoSupportedFrameRateRanges) {
     maxSupportedFramerate = fmax(maxSupportedFramerate, fpsRange.maxFrameRate);
+    minSupportedFramerate = fmin(minSupportedFramerate, fpsRange.minFrameRate);
   }
-  return fmin(maxSupportedFramerate, targetFps);
+  if (maxSupportedFramerate <= 0) {
+    return wanted;
+  }
+  NSInteger fps = (NSInteger)fmin(maxSupportedFramerate, (Float64)wanted);
+  NSInteger floorFps = (NSInteger)ceil(minSupportedFramerate);
+  return MAX(MAX(fps, floorFps), 1);
 }
 
 @end

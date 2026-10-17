@@ -339,11 +339,21 @@
 }
 
 - (NSInteger)selectFpsForFormat:(AVCaptureDeviceFormat*)format targetFps:(NSInteger)targetFps {
+  // No frame rate asked for (targetFps 0) means 30, never 0: a frame
+  // duration of 1/0 makes AVFoundation fall back to the format's top rate.
+  NSInteger wanted = targetFps > 0 ? targetFps : 30;
   Float64 maxSupportedFramerate = 0;
+  Float64 minSupportedFramerate = DBL_MAX;
   for (AVFrameRateRange* fpsRange in format.videoSupportedFrameRateRanges) {
     maxSupportedFramerate = fmax(maxSupportedFramerate, fpsRange.maxFrameRate);
+    minSupportedFramerate = fmin(minSupportedFramerate, fpsRange.minFrameRate);
   }
-  return fmin(maxSupportedFramerate, targetFps);
+  if (maxSupportedFramerate <= 0) {
+    return wanted;
+  }
+  NSInteger fps = (NSInteger)fmin(maxSupportedFramerate, (Float64)wanted);
+  NSInteger floorFps = (NSInteger)ceil(minSupportedFramerate);
+  return MAX(MAX(fps, floorFps), 1);
 }
 
 
