@@ -706,9 +706,15 @@ public class GetUserMediaImpl {
         }
 
         if (constraintsMap.getType(key) == ObjectType.Map) {
+            // ConstrainULong / ConstrainDouble: {exact}, {ideal} or {max}, as a number or a
+            // string. The `ideal` used to be looked up in the outer map, so a {max: 24} frame
+            // rate (what LiveKit asks for) read as null and the camera ran at 30 fps.
             ConstraintsMap innerMap = constraintsMap.getMap(key);
-            if (constraintsMap.getType("ideal") == ObjectType.Number) {
-                return innerMap.getInt("ideal");
+            for (String bound : new String[] {"exact", "ideal", "max"}) {
+                Integer value = getConstrainInt(innerMap, bound);
+                if (value != null && value > 0) {
+                    return value;
+                }
             }
         }
 
@@ -776,6 +782,24 @@ public class GetUserMediaImpl {
             if (sameCamera) {
                 Log.w(TAG, "getUserMedia(video): camera already active (track=" + entry.getKey()
                         + "), reusing VideoSource to prevent concurrent camera access");
+                // The camera takes the size and frame rate asked for now: a smaller format
+                // asked for (a phone that heats up) used to change nothing.
+                int[] wanted = targetFormat(videoConstraintsMap, videoConstraintsMandatory);
+                Size wantedSize = closestCaptureFormat(cameraEnumerator, existing.capturer,
+                        existing.cameraName, wanted[0], wanted[1]);
+                int wantedWidth = wantedSize != null ? wantedSize.width : wanted[0];
+                int wantedHeight = wantedSize != null ? wantedSize.height : wanted[1];
+                if (existing.capturer != null && (wantedWidth != existing.width
+                        || wantedHeight != existing.height || wanted[2] != existing.fps)) {
+                    Log.d(TAG, "getUserMedia(video): capture " + existing.width + "x"
+                            + existing.height + "@" + existing.fps + " -> " + wantedWidth + "x"
+                            + wantedHeight + "@" + wanted[2]);
+                    existing.capturer.changeCaptureFormat(wanted[0], wanted[1], wanted[2]);
+                    existing.width = wantedWidth;
+                    existing.height = wantedHeight;
+                    existing.fps = wanted[2];
+                    capFrameRate(existing.videoSource, wanted[2]);
+                }
                 return buildSharedVideoTrack(existing, entry.getKey(), mediaStream);
             }
         }
@@ -812,26 +836,10 @@ public class GetUserMediaImpl {
 
         VideoCapturerInfoEx info = new VideoCapturerInfoEx();
 
-        Integer videoWidth = getConstrainInt(videoConstraintsMap, "width");
-        int targetWidth = videoWidth != null
-                ? videoWidth
-                : videoConstraintsMandatory != null && videoConstraintsMandatory.hasKey("minWidth")
-                ? videoConstraintsMandatory.getInt("minWidth")
-                : DEFAULT_WIDTH;
-
-        Integer videoHeight = getConstrainInt(videoConstraintsMap, "height");
-        int targetHeight = videoHeight != null
-                ? videoHeight
-                : videoConstraintsMandatory != null && videoConstraintsMandatory.hasKey("minHeight")
-                ? videoConstraintsMandatory.getInt("minHeight")
-                : DEFAULT_HEIGHT;
-
-        Integer videoFrameRate = getConstrainInt(videoConstraintsMap, "frameRate");
-        int targetFps = videoFrameRate != null
-                ? videoFrameRate
-                : videoConstraintsMandatory != null && videoConstraintsMandatory.hasKey("minFrameRate")
-                ? videoConstraintsMandatory.getInt("minFrameRate")
-                : DEFAULT_FPS;
+        int[] target = targetFormat(videoConstraintsMap, videoConstraintsMandatory);
+        int targetWidth = target[0];
+        int targetHeight = target[1];
+        int targetFps = target[2];
 
         info.width = targetWidth;
         info.height = targetHeight;
@@ -840,14 +848,8 @@ public class GetUserMediaImpl {
         info.cameraName = deviceId;
 
         // Find actual capture format.
-        Size actualSize = null;
-        if (videoCapturer instanceof Camera1Capturer) {
-            int cameraId = Camera1Helper.getCameraId(deviceId);
-            actualSize = Camera1Helper.findClosestCaptureFormat(cameraId, targetWidth, targetHeight);
-        } else if (videoCapturer instanceof Camera2Capturer) {
-            CameraManager cameraManager = (CameraManager) applicationContext.getSystemService(Context.CAMERA_SERVICE);
-            actualSize = Camera2Helper.findClosestCaptureFormat(cameraManager, deviceId, targetWidth, targetHeight);
-        }
+        Size actualSize = closestCaptureFormat(cameraEnumerator, videoCapturer, deviceId,
+                targetWidth, targetHeight);
 
         if (actualSize != null) {
             info.width = actualSize.width;
@@ -858,6 +860,7 @@ public class GetUserMediaImpl {
         info.videoSource = videoSource;
         info.facingMode = facingMode;
         videoCapturer.startCapture(targetWidth, targetHeight, targetFps);
+        capFrameRate(videoSource, targetFps);
 
         cameraEventsHandler.waitForCameraOpen();
 
@@ -895,6 +898,58 @@ public class GetUserMediaImpl {
         trackParams.putMap("settings", settings.toMap());
 
         return trackParams;
+    }
+
+    /** Width, height and frame rate asked for in {@code video} (or its mandatory part). */
+    private int[] targetFormat(@Nullable ConstraintsMap video, @Nullable ConstraintsMap mandatory) {
+        Integer videoWidth = getConstrainInt(video, "width");
+        int targetWidth = videoWidth != null
+                ? videoWidth
+                : mandatory != null && mandatory.hasKey("minWidth")
+                ? mandatory.getInt("minWidth")
+                : DEFAULT_WIDTH;
+
+        Integer videoHeight = getConstrainInt(video, "height");
+        int targetHeight = videoHeight != null
+                ? videoHeight
+                : mandatory != null && mandatory.hasKey("minHeight")
+                ? mandatory.getInt("minHeight")
+                : DEFAULT_HEIGHT;
+
+        Integer videoFrameRate = getConstrainInt(video, "frameRate");
+        int targetFps = videoFrameRate != null
+                ? videoFrameRate
+                : mandatory != null && mandatory.hasKey("minFrameRate")
+                ? mandatory.getInt("minFrameRate")
+                : DEFAULT_FPS;
+        return new int[] {targetWidth, targetHeight, targetFps};
+    }
+
+    /** The camera's own size closest to the one asked for, or null if unknown. */
+    @Nullable
+    private Size closestCaptureFormat(CameraEnumerator enumerator, @Nullable VideoCapturer capturer,
+            String deviceId, int width, int height) {
+        if (capturer instanceof Camera1Capturer) {
+            int cameraId = Camera1Helper.getCameraId(deviceId);
+            return Camera1Helper.findClosestCaptureFormat(cameraId, width, height);
+        } else if (capturer instanceof Camera2Capturer) {
+            CameraManager cameraManager = (CameraManager) applicationContext.getSystemService(Context.CAMERA_SERVICE);
+            return Camera2Helper.findClosestCaptureFormat(cameraManager, deviceId, width, height);
+        }
+        return null;
+    }
+
+    /**
+     * Frames past {@code fps} are dropped at the source. WebRTC picks the camera's frame rate
+     * range with a penalty on a high minimum: for 24 fps it takes [15, 30] over [24, 24] and the
+     * camera runs at 30. The encoder, the frame encryption and the preview then get 24.
+     */
+    private static void capFrameRate(@Nullable VideoSource source, int fps) {
+        if (source == null || fps <= 0) {
+            return;
+        }
+        source.adaptOutputFormat(VideoSource.AspectRatio.UNDEFINED, null,
+                VideoSource.AspectRatio.UNDEFINED, null, fps);
     }
 
     /**

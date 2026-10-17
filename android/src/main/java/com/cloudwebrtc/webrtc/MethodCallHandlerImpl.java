@@ -246,10 +246,16 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
 
     warpEnabled = enableWARP;
 
+    // No internal tracer, and with logSeverity none no logger at all: an
+    // injected logger only filters what reaches it, while WebRTC kept writing
+    // its own logs (SDP, codecs, one line per encrypted frame) to logcat.
+    final boolean silent = logSeverity == Severity.LS_NONE;
     InitializationOptions.Builder initializationOptionsBuilder =
             InitializationOptions.builder(context)
-                    .setEnableInternalTracer(true)
-                    .setInjectableLogger(logSink, logSeverity);
+                    .setEnableInternalTracer(false);
+    if (!silent) {
+      initializationOptionsBuilder.setInjectableLogger(logSink, logSeverity);
+    }
 
     String fieldTrials = "";
     if (enableWARP) {
@@ -264,6 +270,10 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
 
     PeerConnectionFactory.initialize(initializationOptionsBuilder.createInitializationOptions());
+    if (silent) {
+      // The native logs to logcat off too (only allowed with no logger injected).
+      Logging.enableLogToDebugOutput(Severity.LS_NONE);
+    }
 
     getUserMediaImpl = new GetUserMediaImpl(this, context);
 
