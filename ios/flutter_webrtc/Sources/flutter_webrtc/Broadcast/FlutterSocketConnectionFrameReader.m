@@ -101,8 +101,11 @@ const NSUInteger kMaxReadLength = 10 * 1024;
   NSData* messageData = CFBridgingRelease(CFHTTPMessageCopyBody(_framedMessage));
 
   // Copy the pixel buffer
+  // Backed by an IOSurface, as the encoder takes it without a copy.
+  NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
   CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                        kCVPixelFormatType_32BGRA, NULL, &_imageBuffer);
+                                        kCVPixelFormatType_32BGRA,
+                                        (__bridge CFDictionaryRef)attributes, &_imageBuffer);
   if (status != kCVReturnSuccess) {
     NSLog(@"CVPixelBufferCreate failed");
     return false;
@@ -224,7 +227,11 @@ const NSUInteger kMaxReadLength = 10 * 1024;
       break;
   }
 
-  RTCVideoFrame* videoFrame = [[RTCVideoFrame alloc] initWithBuffer:[rtcPixelBuffer toI420]
+  // The pixel buffer itself, as a camera's frames: the H.264 encoder crops
+  // and scales a native buffer into its own size, while an I420 copy is
+  // written into its pool at the frame's size and overruns the pool when
+  // the encoder runs at another size (a crash in the encoder's queue).
+  RTCVideoFrame* videoFrame = [[RTCVideoFrame alloc] initWithBuffer:rtcPixelBuffer
                                                            rotation:rotation
                                                         timeStampNs:frameTimeStampNs];
 
