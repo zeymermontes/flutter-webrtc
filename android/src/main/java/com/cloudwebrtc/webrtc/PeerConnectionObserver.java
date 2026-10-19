@@ -65,7 +65,14 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
   // that exact object.
   private final Map<String, MediaStreamTrack> remoteTracksByReceiver =
       new ConcurrentHashMap<>();
-  final Map<String, RtpTransceiver> transceivers = new HashMap<>();
+  // Written from the signaling thread (onAddTrack) and the platform thread.
+  final Map<String, RtpTransceiver> transceivers = new ConcurrentHashMap<>();
+  // Unified Plan: the transceiver of each onTrack, by receiver id, until the
+  // onAddTrack of that receiver (which WebRTC fires right after it) takes it.
+  // These objects belong to the native observer, which disposes them with the
+  // peer connection: they must not be disposed here.
+  private final Map<String, RtpTransceiver> transceiversFromOnTrack =
+      new ConcurrentHashMap<>();
   private final StateProvider stateProvider;
   private final EventChannel eventChannel;
   private EventChannel.EventSink eventSink;
@@ -113,6 +120,7 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
     remoteStreams.clear();
     remoteTracks.clear();
     remoteTracksByReceiver.clear();
+    transceiversFromOnTrack.clear();
     // The data channels stay registered until dispose() so that their event
     // channel handlers can be released there. Closing the peer connection
     // already closes them.
@@ -520,6 +528,10 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
 
   @Override
   public void onTrack(RtpTransceiver transceiver) {
+    RtpReceiver receiver = transceiver.getReceiver();
+    if (receiver != null) {
+      transceiversFromOnTrack.put(receiver.id(), transceiver);
+    }
   }
 
   @Override
@@ -581,11 +593,23 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
         stateProvider.onRemoteTrackAdded(id, streamId, receiverTrack);
       }
 
-      // getTransceivers() disposes the objects of its previous call: a call
-      // from the app's thread at the same time can dispose them under this
-      // loop. An exception thrown here would reach WebRTC's signaling
-      // thread and abort the process, so the list is read again instead.
-      for (int attempt = 0; attempt < 3; attempt++) {
+      // The transceiver comes from onTrack when it fired for this receiver:
+      // getTransceivers() disposes the objects of its previous call, and a
+      // call from the app's thread at the same time could dispose them under
+      // a loop on this (the signaling) thread.
+      RtpTransceiver own = transceiversFromOnTrack.remove(receiver.id());
+      if (own != null) {
+        String transceiverId = own.getMid();
+        if (null == transceiverId) {
+          transceiverId = stateProvider.getNextStreamUUID();
+          this.transceivers.put(transceiverId, own);
+        }
+        params.putMap("transceiver", transceiverToMap(transceiverId, own));
+      }
+      // Otherwise the list is read, and read again when it was disposed
+      // meanwhile: an exception thrown here would reach WebRTC's signaling
+      // thread and abort the process.
+      for (int attempt = 0; own == null && attempt < 3; attempt++) {
         try {
           List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
           for (RtpTransceiver transceiver : transceivers) {
