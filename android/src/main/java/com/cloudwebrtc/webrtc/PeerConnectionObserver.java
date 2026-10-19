@@ -222,12 +222,18 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
 
   RtpTransceiver getRtpTransceiverById(String id) {
     RtpTransceiver transceiver = transceivers.get(id);
-    if (null == transceiver) {
-      List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
-      for (RtpTransceiver t : transceivers) {
-        if (id.equals(t.getMid())) {
-          transceiver = t;
+    // Read again when another thread's read disposed the list meanwhile.
+    for (int attempt = 0; null == transceiver && attempt < 3; attempt++) {
+      try {
+        List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
+        for (RtpTransceiver t : transceivers) {
+          if (id.equals(t.getMid())) {
+            transceiver = t;
+          }
         }
+        break;
+      } catch (IllegalStateException e) {
+        transceiver = null;
       }
     }
     return transceiver;
@@ -575,15 +581,26 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
         stateProvider.onRemoteTrackAdded(id, streamId, receiverTrack);
       }
 
-      List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
-      for (RtpTransceiver transceiver : transceivers) {
-        if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
-          String transceiverId = transceiver.getMid();
-          if (null == transceiverId) {
-            transceiverId = stateProvider.getNextStreamUUID();
-            this.transceivers.put(transceiverId,transceiver);
+      // getTransceivers() disposes the objects of its previous call: a call
+      // from the app's thread at the same time can dispose them under this
+      // loop. An exception thrown here would reach WebRTC's signaling
+      // thread and abort the process, so the list is read again instead.
+      for (int attempt = 0; attempt < 3; attempt++) {
+        try {
+          List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
+          for (RtpTransceiver transceiver : transceivers) {
+            if (transceiver.getReceiver() != null && receiver.id().equals(transceiver.getReceiver().id())) {
+              String transceiverId = transceiver.getMid();
+              if (null == transceiverId) {
+                transceiverId = stateProvider.getNextStreamUUID();
+                this.transceivers.put(transceiverId,transceiver);
+              }
+              params.putMap("transceiver", transceiverToMap(transceiverId, transceiver));
+            }
           }
-          params.putMap("transceiver", transceiverToMap(transceiverId, transceiver));
+          break;
+        } catch (IllegalStateException e) {
+          Log.w(TAG, "onAddTrack: transceivers disposed meanwhile, reading them again");
         }
       }
     }
@@ -1255,15 +1272,28 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
   }
 
   public void getTransceivers(Result result) {
-    List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
     ConstraintsArray transceiversParams = new ConstraintsArray();
-    for (RtpTransceiver transceiver : transceivers) {
-      String transceiverId = transceiver.getMid();
-      if (null == transceiverId) {
-        transceiverId = stateProvider.getNextStreamUUID();
-        this.transceivers.put(transceiverId,transceiver);
+    // Read again when the signaling thread's own read (onAddTrack)
+    // disposed this list's objects meanwhile.
+    for (int attempt = 0; ; attempt++) {
+      try {
+        transceiversParams = new ConstraintsArray();
+        List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
+        for (RtpTransceiver transceiver : transceivers) {
+          String transceiverId = transceiver.getMid();
+          if (null == transceiverId) {
+            transceiverId = stateProvider.getNextStreamUUID();
+            this.transceivers.put(transceiverId,transceiver);
+          }
+          transceiversParams.pushMap(new ConstraintsMap(transceiverToMap(transceiverId, transceiver)));
+        }
+        break;
+      } catch (IllegalStateException e) {
+        if (attempt >= 2) {
+          resultError("getTransceivers", "transceivers disposed meanwhile", result);
+          return;
+        }
       }
-      transceiversParams.pushMap(new ConstraintsMap(transceiverToMap(transceiverId, transceiver)));
     }
     ConstraintsMap params = new ConstraintsMap();
     params.putArray("transceivers", transceiversParams.toArrayList());
@@ -1275,15 +1305,23 @@ class PeerConnectionObserver implements PeerConnection.Observer, EventChannel.St
       return null;
     }
     MediaStreamTrack track = null;
-    List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
-    for (RtpTransceiver transceiver : transceivers) {
-      RtpReceiver receiver = transceiver.getReceiver();
-      if (receiver != null) {
-        MediaStreamTrack receiverTrack = receiver.track();
-        if (receiverTrack != null && receiverTrack.id().equals(trackId)) {
-          track = receiverTrack;
-          break;
+    // Read again when another thread's read disposed the list meanwhile.
+    for (int attempt = 0; attempt < 3; attempt++) {
+      try {
+        List<RtpTransceiver> transceivers = peerConnection.getTransceivers();
+        for (RtpTransceiver transceiver : transceivers) {
+          RtpReceiver receiver = transceiver.getReceiver();
+          if (receiver != null) {
+            MediaStreamTrack receiverTrack = receiver.track();
+            if (receiverTrack != null && receiverTrack.id().equals(trackId)) {
+              track = receiverTrack;
+              break;
+            }
+          }
         }
+        break;
+      } catch (IllegalStateException e) {
+        track = null;
       }
     }
     return track;
