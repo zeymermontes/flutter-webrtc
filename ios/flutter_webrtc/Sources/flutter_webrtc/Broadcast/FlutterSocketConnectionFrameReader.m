@@ -101,10 +101,13 @@ const NSUInteger kMaxReadLength = 10 * 1024;
   NSData* messageData = CFBridgingRelease(CFHTTPMessageCopyBody(_framedMessage));
 
   // Copy the pixel buffer
-  // Backed by an IOSurface, as the encoder takes it without a copy.
+  // NV12 backed by an IOSurface, as a camera's frames: the H.264 encoder
+  // takes it without a copy, and when it has to crop it does so into its
+  // NV12 pool (a BGRA source would be written there four bytes a pixel).
   NSDictionary* attributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
-  CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                        kCVPixelFormatType_32BGRA,
+  CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width & ~(size_t)1,
+                                        height & ~(size_t)1,
+                                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                                         (__bridge CFDictionaryRef)attributes, &_imageBuffer);
   if (status != kCVReturnSuccess) {
     NSLog(@"CVPixelBufferCreate failed");
