@@ -37,6 +37,7 @@ import com.cloudwebrtc.webrtc.utils.Callback;
 import com.cloudwebrtc.webrtc.utils.ConstraintsArray;
 import com.cloudwebrtc.webrtc.utils.ConstraintsMap;
 import com.cloudwebrtc.webrtc.utils.EglUtils;
+import com.cloudwebrtc.webrtc.utils.NativeLogFilter;
 import com.cloudwebrtc.webrtc.utils.ObjectType;
 import com.cloudwebrtc.webrtc.utils.PermissionUtils;
 import com.cloudwebrtc.webrtc.utils.Utils;
@@ -250,6 +251,11 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     // injected logger only filters what reaches it, while WebRTC kept writing
     // its own logs (SDP, codecs, one line per encrypted frame) to logcat.
     final boolean silent = logSeverity == Severity.LS_NONE;
+    if (silent) {
+      // Before anything native runs: libwebrtc ignores the severity below
+      // and would still write its logs, E2EE keys included, to logcat.
+      NativeLogFilter.dropWebRtcLogs();
+    }
     InitializationOptions.Builder initializationOptionsBuilder =
             InitializationOptions.builder(context)
                     .setEnableInternalTracer(false);
