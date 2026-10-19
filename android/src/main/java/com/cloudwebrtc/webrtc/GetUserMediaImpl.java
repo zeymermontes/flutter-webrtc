@@ -506,8 +506,17 @@ public class GetUserMediaImpl {
                 });
     }
 
+    /** Sent (to this app only) when the system stops a screen capture: MOCA-894. */
+    public static final String ACTION_SCREEN_CAPTURE_STOPPED =
+            "com.cloudwebrtc.webrtc.SCREEN_CAPTURE_STOPPED";
+
     void getDisplayMedia(
             final ConstraintsMap constraints, final Result result, final MediaStream mediaStream) {
+        // MOCA-894: the size and frame rate asked for (the display's own size at 30 fps
+        // before, whatever was asked).
+        ConstraintsMap video = constraints.getType("video") == ObjectType.Map
+                ? constraints.getMap("video") : null;
+        final int[] target = displayTarget(video);
         if (mediaProjectionData == null) {
             screenRequestPermissions(
                     new ResultReceiver(new Handler(Looper.getMainLooper())) {
@@ -520,15 +529,33 @@ public class GetUserMediaImpl {
                                 resultError("screenRequestPermissions", "User didn't give permission to capture the screen.", result);
                                 return;
                             }
-                            getDisplayMedia(result, mediaStream, mediaProjectionData);
+                            getDisplayMedia(result, mediaStream, mediaProjectionData, target);
                         }
                     });
         } else {
-            getDisplayMedia(result, mediaStream, mediaProjectionData);
+            // MOCA-894: a consent is good for one capture only (Android 14 refuses it
+            // again): the next capture asks for a new one.
+            Intent data = mediaProjectionData;
+            this.mediaProjectionData = null;
+            getDisplayMedia(result, mediaStream, data, target);
         }
     }
 
-    private void getDisplayMedia(final Result result, final MediaStream mediaStream, final Intent mediaProjectionData) {
+    /**
+     * MOCA-894: the longest and shortest side and the frame rate asked for in
+     * {@code video} (null or 0: the display's own size, 30 fps).
+     */
+    private int[] displayTarget(@Nullable ConstraintsMap video) {
+        Integer w = getConstrainInt(video, "width");
+        Integer h = getConstrainInt(video, "height");
+        Integer fps = getConstrainInt(video, "frameRate");
+        int a = w != null ? w : 0;
+        int b = h != null ? h : 0;
+        return new int[] {Math.max(a, b), Math.min(a, b), fps != null && fps > 0 ? fps : DEFAULT_FPS};
+    }
+
+    private void getDisplayMedia(final Result result, final MediaStream mediaStream,
+            final Intent mediaProjectionData, final int[] target) {
         /* Create ScreenCapture */
         VideoTrack displayTrack = null;
         VideoCapturer videoCapturer = null;
@@ -539,6 +566,11 @@ public class GetUserMediaImpl {
                             @Override
                             public void onStop() {
                                 super.onStop();
+                                // MOCA-894: stopped by the system (its "stop sharing", the
+                                // screen locked): the app is told, to stop publishing it.
+                                Intent stopped = new Intent(ACTION_SCREEN_CAPTURE_STOPPED);
+                                stopped.setPackage(applicationContext.getPackageName());
+                                applicationContext.sendBroadcast(stopped);
                                 // After Huawei P30 and Android 10 version test, the onstop method is called, which will not affect the next process,
                                 // and there is no need to call the resulterror method
                                 //resultError("MediaProjection.Callback()", "User revoked permission to capture the screen.", result);
@@ -565,11 +597,22 @@ public class GetUserMediaImpl {
         Point size = new Point();
         display.getRealSize(size);
 
+        // MOCA-894: the display scaled down to fit the size asked for (the system draws
+        // the smaller copy; nothing scales full-size frames after), sides kept even.
+        double scale = 1.0;
+        int longSide = Math.max(size.x, size.y);
+        int shortSide = Math.min(size.x, size.y);
+        if (target[0] > 0 && target[1] > 0 && longSide > 0 && shortSide > 0) {
+            scale = Math.min(1.0, Math.min((double) target[0] / longSide, (double) target[1] / shortSide));
+        }
         VideoCapturerInfoEx info = new VideoCapturerInfoEx();
-        info.width = size.x;
-        info.height = size.y;
-        info.fps = DEFAULT_FPS;
+        info.width = ((int) Math.round(size.x * scale)) & ~1;
+        info.height = ((int) Math.round(size.y * scale)) & ~1;
+        info.fps = target[2];
         info.isScreenCapture = true;
+        // The frame rate is capped before the encoder (a still screen sends no frames).
+        videoSource.adaptOutputFormat(Math.max(info.width, info.height),
+                Math.min(info.width, info.height), info.fps);
         info.capturer = videoCapturer;
 
         videoCapturer.startCapture(info.width, info.height, info.fps);
@@ -601,6 +644,12 @@ public class GetUserMediaImpl {
             track_.putString("label", kind);
             track_.putString("readyState", displayTrack.state().toString());
             track_.putBoolean("remote", false);
+            // MOCA-894: what the capture sends, for the encodings computed from it.
+            ConstraintsMap settings = new ConstraintsMap();
+            settings.putInt("width", info.width);
+            settings.putInt("height", info.height);
+            settings.putInt("frameRate", info.fps);
+            track_.putMap("settings", settings.toMap());
 
             videoTracks.pushMap(track_);
             mediaStream.addTrack(displayTrack);
