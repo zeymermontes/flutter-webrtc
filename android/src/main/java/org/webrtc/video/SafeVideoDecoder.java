@@ -23,12 +23,21 @@ import org.webrtc.WrappedNativeVideoDecoder;
  * AndroidVideoDecoder does itself when MediaCodec can not be created:
  * libwebrtc then tries a software decoder when there is one, or drops that
  * stream's frames and asks for a key frame later.
+ *
+ * <p>A decoder set up again (after a release, the software fallback taking
+ * over, or a decode that failed) starts from a key frame: until one comes,
+ * delta frames are answered {@link VideoCodecStatus#ERROR} without reaching
+ * it, and libwebrtc asks the sender for a key frame. Fed delta frames
+ * without the key frame they build on, a decoder draws green or broken
+ * blocks until the next periodic key frame, which in a group call can be
+ * more than a minute away (MOCA-1101).
  */
 public class SafeVideoDecoder implements VideoDecoder {
   private static final String TAG = "SafeVideoDecoder";
 
   private final VideoDecoder delegate;
   private volatile boolean initialized = false;
+  private volatile boolean keyFrameRequired = true;
 
   SafeVideoDecoder(VideoDecoder delegate) {
     this.delegate = delegate;
@@ -54,6 +63,7 @@ public class SafeVideoDecoder implements VideoDecoder {
     try {
       final VideoCodecStatus status = delegate.initDecode(settings, decodeCallback);
       initialized = status == VideoCodecStatus.OK;
+      keyFrameRequired = true;
       return status;
     } catch (Throwable e) {
       initialized = false;
@@ -72,9 +82,19 @@ public class SafeVideoDecoder implements VideoDecoder {
   @Override
   public VideoCodecStatus decode(EncodedImage frame, DecodeInfo info) {
     if (!initialized) return VideoCodecStatus.UNINITIALIZED;
+    if (keyFrameRequired && frame != null) {
+      if (frame.frameType != EncodedImage.FrameType.VideoFrameKey) {
+        // Nothing to build on: libwebrtc asks for a key frame.
+        return VideoCodecStatus.ERROR;
+      }
+      keyFrameRequired = false;
+    }
     try {
-      return delegate.decode(frame, info);
+      final VideoCodecStatus status = delegate.decode(frame, info);
+      if (status == VideoCodecStatus.ERROR) keyFrameRequired = true;
+      return status;
     } catch (Throwable e) {
+      keyFrameRequired = true;
       warn("decode failed in " + implementationName() + ": "
           + e.getClass().getSimpleName());
       return VideoCodecStatus.ERROR;
@@ -84,6 +104,7 @@ public class SafeVideoDecoder implements VideoDecoder {
   @Override
   public VideoCodecStatus release() {
     initialized = false;
+    keyFrameRequired = true;
     try {
       return delegate.release();
     } catch (Throwable e) {
