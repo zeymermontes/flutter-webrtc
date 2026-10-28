@@ -42,6 +42,12 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
   @override
   int? get textureId => _textureId;
 
+  int _textureQuarterTurns = 0;
+
+  /// Quarter turns clockwise the texture's picture still needs to stand
+  /// upright (0 where the platform turns it before handing it over).
+  int get textureQuarterTurns => _textureQuarterTurns;
+
   @override
   MediaStream? get srcObject => _srcObject;
 
@@ -118,6 +124,11 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
     final Map<dynamic, dynamic> map = event;
     switch (map['event']) {
       case 'didTextureChangeRotation':
+        // Where the platform hands the picture over as it was decoded (iOS),
+        // the view turns it by this much; elsewhere it comes turned already.
+        final textureRotation = map['textureRotation'];
+        _textureQuarterTurns =
+            textureRotation is int ? (textureRotation ~/ 90) % 4 : 0;
         value =
             value.copyWith(rotation: map['rotation'], renderVideo: renderVideo);
         onResize?.call();

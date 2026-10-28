@@ -44,24 +44,27 @@ class RTCVideoView extends StatelessWidget {
           child: Center(
             child: ValueListenableBuilder<RTCVideoValue>(
               valueListenable: videoRenderer,
+              // Built with the value: the turn comes with the rotation.
               builder:
                   (BuildContext context, RTCVideoValue value, Widget? child) {
                 return SizedBox(
                   width: constraints.maxHeight * value.aspectRatio,
                   height: constraints.maxHeight,
-                  child: child,
+                  child: Transform(
+                    transform: Matrix4.identity()..rotateY(mirror ? -pi : 0.0),
+                    alignment: FractionalOffset.center,
+                    child: videoRenderer.renderVideo
+                        ? RotatedBox(
+                            quarterTurns: videoRenderer.textureQuarterTurns,
+                            child: Texture(
+                              textureId: videoRenderer.textureId!,
+                              filterQuality: filterQuality,
+                            ),
+                          )
+                        : placeholderBuilder?.call(context) ?? Container(),
+                  ),
                 );
               },
-              child: Transform(
-                transform: Matrix4.identity()..rotateY(mirror ? -pi : 0.0),
-                alignment: FractionalOffset.center,
-                child: videoRenderer.renderVideo
-                    ? Texture(
-                        textureId: videoRenderer.textureId!,
-                        filterQuality: filterQuality,
-                      )
-                    : placeholderBuilder?.call(context) ?? Container(),
-              ),
             ),
           ),
         ),
