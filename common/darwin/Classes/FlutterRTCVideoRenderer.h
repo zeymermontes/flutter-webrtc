@@ -21,6 +21,9 @@
 
 - (void)dispose;
 
+/// Tells Flutter a new picture is there (unless the texture is gone).
+- (void)notifyFrameAvailable;
+
 @end
 
 @interface FlutterWebRTCPlugin (FlutterVideoRendererManager)

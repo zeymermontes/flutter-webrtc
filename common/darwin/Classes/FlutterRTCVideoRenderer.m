@@ -11,6 +11,96 @@
 
 #import "FlutterWebRTCPlugin.h"
 #import <os/lock.h>
+#import <QuartzCore/QuartzCore.h>
+
+#if TARGET_OS_IPHONE
+/// Tells Flutter about new video frames on one shared tick, at most
+/// [kFlutterRTCTextureTickRate] times a second. Every texture that changes
+/// makes Flutter draw a frame; videos arriving each on its own clock (six
+/// at 30 fps) would make it draw at the display's full rate. On one tick
+/// the frames of all of them go into the same Flutter frame. Videos are 30
+/// fps at most, so none of their frames is lost by it.
+static const NSInteger kFlutterRTCTextureTickRate = 30;
+
+@interface FlutterRTCTextureTicker : NSObject
++ (instancetype)shared;
+- (void)markAvailable:(FlutterRTCVideoRenderer*)renderer;
+@end
+
+@implementation FlutterRTCTextureTicker {
+  os_unfair_lock _lock;
+  NSHashTable<FlutterRTCVideoRenderer*>* _pending;
+  CADisplayLink* _link;
+  NSInteger _idleTicks;
+  // Under _lock: the link is running (or about to), no need to start it.
+  BOOL _running;
+}
+
++ (instancetype)shared {
+  static FlutterRTCTextureTicker* ticker;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    ticker = [[FlutterRTCTextureTicker alloc] init];
+  });
+  return ticker;
+}
+
+- (instancetype)init {
+  if (self = [super init]) {
+    _lock = OS_UNFAIR_LOCK_INIT;
+    _pending = [NSHashTable weakObjectsHashTable];
+  }
+  return self;
+}
+
+- (void)markAvailable:(FlutterRTCVideoRenderer*)renderer {
+  os_unfair_lock_lock(&_lock);
+  [_pending addObject:renderer];
+  BOOL start = !_running;
+  _running = YES;
+  os_unfair_lock_unlock(&_lock);
+  if (start) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self start];
+    });
+  }
+}
+
+/// On the main thread.
+- (void)start {
+  _idleTicks = 0;
+  if (_link == nil) {
+    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(onTick:)];
+    if (@available(iOS 15.0, *)) {
+      _link.preferredFrameRateRange =
+          CAFrameRateRangeMake(kFlutterRTCTextureTickRate, kFlutterRTCTextureTickRate,
+                               kFlutterRTCTextureTickRate);
+    } else {
+      _link.preferredFramesPerSecond = kFlutterRTCTextureTickRate;
+    }
+    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+  }
+  _link.paused = NO;
+}
+
+- (void)onTick:(CADisplayLink*)link {
+  os_unfair_lock_lock(&_lock);
+  NSArray<FlutterRTCVideoRenderer*>* due = _pending.allObjects;
+  [_pending removeAllObjects];
+  // No video for a second: the link stops until the next frame.
+  if (due.count == 0 && ++_idleTicks >= kFlutterRTCTextureTickRate) {
+    link.paused = YES;
+    _running = NO;
+  } else if (due.count > 0) {
+    _idleTicks = 0;
+  }
+  os_unfair_lock_unlock(&_lock);
+  for (FlutterRTCVideoRenderer* renderer in due) {
+    [renderer notifyFrameAvailable];
+  }
+}
+@end
+#endif
 
 @implementation FlutterRTCVideoRenderer {
   CGSize _frameSize;
@@ -89,6 +179,15 @@
     CVPixelBufferPoolRelease(_pool);
     _pool = nil;
   }
+}
+
+/// Tells Flutter a new picture is there (unless the texture is gone).
+- (void)notifyFrameAvailable {
+  os_unfair_lock_lock(&_lock);
+  if (_textureId != -1 && _frameAvailable) {
+    [_registry textureFrameAvailable:_textureId];
+  }
+  os_unfair_lock_unlock(&_lock);
 }
 
 - (void)setVideoTrack:(RTCVideoTrack*)videoTrack {
@@ -207,10 +306,12 @@ static BOOL FlutterRTCCanShowPixelBuffer(CVPixelBufferRef buffer) {
   CVPixelBufferRef previous = _pixelBufferRef;
   _pixelBufferRef = picture;
   _frameAvailable = true;
-  if (_textureId != -1) {
-    [_registry textureFrameAvailable:_textureId];
-  }
   os_unfair_lock_unlock(&_lock);
+#if TARGET_OS_IPHONE
+  [[FlutterRTCTextureTicker shared] markAvailable:self];
+#else
+  [self notifyFrameAvailable];
+#endif
   if (previous) {
     CVBufferRelease(previous);
   }
